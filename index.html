@@ -118,9 +118,20 @@
         gap: 1rem 2rem;
       }
 
-      nav a {
+    nav a {
         width: 2.5rem;
-      }
+    }
+
+    nav a:not([data-live]) {
+    pointer-events: none;
+    cursor: default;
+    }
+
+  nav a:not([data-live]):hover {
+    color: var(--hover);
+    pointer-events: auto;
+    cursor: default;
+  }
     }
   </style>
 </head>
@@ -128,7 +139,7 @@
   <div class="wrapper">
     <h1>JOY</h1>
     <nav>
-      <a href="/1/">1</a>
+      <a href="/1/" data-live>1</a>
       <a href="/2/">2</a>
       <a href="/3/">3</a>
       <a href="/4/">4</a>
