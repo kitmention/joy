@@ -1,0 +1,1296 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>YHV – Your History, Visualized</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com"/>
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin/>
+  <link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600&family=DM+Serif+Display&display=swap" rel="stylesheet"/>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    html, body { height: 100%; overflow: hidden; font-family: 'DM Sans', system-ui, sans-serif; }
+    #root { height: 100%; }
+  </style>
+</head>
+<body>
+  <div id="root"></div>
+  <script src="https://unpkg.com/react@18/umd/react.production.min.js" crossorigin></script>
+  <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js" crossorigin></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+  <script type="text/babel">
+
+// ─── CONFIG ─────────────────────────────────────────────────────────────────
+const CLIENT_ID = '1V3RCLDDLIXAYHLZKAMA2NKKCFKP3304IH0UIEM2MLQ42M2W';
+
+const API_V        = '20231010';
+const REDIRECT_URI = window.location.origin + window.location.pathname;
+const TOKEN_KEY    = 'yhv_token';
+const PROFILE_KEY  = 'yhv_profile';
+
+const { useState, useEffect, useRef, useMemo } = React;
+
+// ─── IndexedDB ────────────────────────────────────────────────────────────────
+const DB_NAME = "SwarmCheckins", DB_VERSION = 1, STORE = "checkins";
+let dbPromise = null;
+function getDB() {
+  if (dbPromise) return dbPromise;
+  dbPromise = new Promise((res, rej) => {
+    const req = indexedDB.open(DB_NAME, DB_VERSION);
+    req.onupgradeneeded = e => {
+      const db = e.target.result;
+      if (!db.objectStoreNames.contains(STORE)) {
+        const s = db.createObjectStore(STORE, { keyPath: "id" });
+        s.createIndex("date", "date");
+        s.createIndex("city", "city");
+      }
+    };
+    req.onsuccess = e => res(e.target.result);
+    req.onerror   = e => rej(e.target.error);
+  });
+  return dbPromise;
+}
+async function batchWrite(items) {
+  const db = await getDB();
+  let written = 0, dupes = 0;
+  for (let i = 0; i < items.length; i += 200) {
+    const batch = items.slice(i, i + 200);
+    await new Promise((res, rej) => {
+      const tx = db.transaction(STORE, "readwrite");
+      const store = tx.objectStore(STORE);
+      let pending = batch.length;
+      batch.forEach(item => {
+        const r = store.put(item);
+        r.onsuccess = () => { written++; if (!--pending) res(); };
+        r.onerror   = () => { dupes++;   if (!--pending) res(); };
+      });
+      tx.onerror = rej;
+    });
+  }
+  return { written, dupes };
+}
+async function getAllCheckins() {
+  const db = await getDB();
+  return new Promise((res, rej) => {
+    const tx  = db.transaction(STORE, "readonly");
+    const req = tx.objectStore(STORE).getAll();
+    req.onsuccess = () => res(req.result || []);
+    req.onerror = rej;
+  });
+}
+async function getCheckinCount() {
+  const db = await getDB();
+  return new Promise((res, rej) => {
+    const tx  = db.transaction(STORE, "readonly");
+    const req = tx.objectStore(STORE).count();
+    req.onsuccess = () => res(req.result);
+    req.onerror = rej;
+  });
+}
+async function clearAllCheckins() {
+  const db = await getDB();
+  return new Promise((res, rej) => {
+    const tx = db.transaction(STORE, "readwrite");
+    tx.objectStore(STORE).clear().onsuccess = res;
+    tx.onerror = rej;
+  });
+}
+
+// ─── Helpers ──────────────────────────────────────────────────────────────────
+function extractNumber(obj, ...keys) {
+  for (const key of keys) {
+    let val = obj;
+    for (const part of key.split(".")) {
+      if (val == null || typeof val !== "object") { val = undefined; break; }
+      val = val[part];
+    }
+    const n = parseFloat(val);
+    if (!isNaN(n)) return n;
+  }
+  return null;
+}
+function extractString(obj, ...keys) {
+  for (const key of keys) {
+    let val = obj;
+    for (const part of key.split(".")) {
+      if (val == null || typeof val !== "object") { val = undefined; break; }
+      val = val[part];
+    }
+    if (val && typeof val === "string" && val.trim()) return val.trim();
+    if (Array.isArray(val) && val[0]) {
+      const s = typeof val[0] === "string" ? val[0] : val[0]?.name || val[0]?.shortName;
+      if (s) return s;
+    }
+  }
+  return null;
+}
+function parseTimestamp(raw) {
+  if (raw == null) return null;
+  if (typeof raw === "number") {
+    const d = new Date(raw > 1e11 ? raw : raw * 1000);
+    return isNaN(d) ? null : d.toISOString();
+  }
+  if (typeof raw === "string") {
+    const d = new Date(raw);
+    return isNaN(d) ? null : d.toISOString();
+  }
+  return null;
+}
+function extractPhotos(raw) {
+  if (!raw) return [];
+  const items = raw?.items || raw?.photos?.items || (Array.isArray(raw) ? raw : null);
+  if (!items) return [];
+  return items.slice(0, 6).map(item => {
+    if (typeof item === "string") return item;
+    if (item.prefix && item.suffix) return `${item.prefix}width300${item.suffix}`;
+    return item.url || null;
+  }).filter(Boolean);
+}
+function parseCheckin(raw) {
+  try {
+    const venue = raw.venue || raw.Venue || {};
+    const loc   = venue.location || raw.location || {};
+    const lat = extractNumber(raw,"lat","latitude") || extractNumber(venue,"lat","latitude") || extractNumber(loc,"lat","latitude");
+    const lng = extractNumber(raw,"lng","lon","longitude") || extractNumber(venue,"lng","lon","longitude") || extractNumber(loc,"lng","lon","longitude");
+    if (lat == null || lng == null || Math.abs(lat) > 90 || Math.abs(lng) > 180) return null;
+    const date = parseTimestamp(raw.createdAt || raw.created_at || raw.timestamp || raw.date);
+    if (!date) return null;
+    const catRaw = raw.category || raw.categories?.[0]?.name || venue.categories?.[0]?.name || venue.categories?.[0]?.shortName || extractString(venue,"categories.0.name") || "Other";
+    return {
+      id:       String(raw.id || raw._id || `${lat}_${lng}_${date}`),
+      lat, lng, date,
+      name:     extractString(raw,"name","Name") || extractString(venue,"name","Name") || "Unknown",
+      category: typeof catRaw === "string" ? catRaw : (catRaw?.name || "Other"),
+      city:     extractString(loc,"city") || extractString(venue,"location.city") || "",
+      country:  extractString(loc,"country") || extractString(venue,"location.country") || "",
+      address:  extractString(loc,"formattedAddress","address") || "",
+      shout:    raw.shout || raw.comment || "",
+      photos:   extractPhotos(raw.photos),
+      venueId:  venue.id || "",
+    };
+  } catch { return null; }
+}
+
+// ─── Theme & Constants ────────────────────────────────────────────────────────
+const T = { bg:"#f0f0ec", card:"#fff", border:"#e5e5e0", text:"#1a1a1a", muted:"#888", accent:"#f97316" };
+const MONTHS = ["January","February","March","April","May","June","July","August","September","October","November","December"];
+const DAYS   = ["Sunday","Monday","Tuesday","Wednesday","Thursday","Friday","Saturday"];
+
+// ─── Tile providers ───────────────────────────────────────────────────────────
+const TILES = [
+  { url:"https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png",          opts:{ attribution:"© OpenStreetMap contributors", subdomains:"abc",  maxZoom:19 } },
+  { url:"https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}.png", opts:{ attribution:"© CARTO © OSM",                 subdomains:"abcd", maxZoom:19 } },
+  { url:"https://tile.openstreetmap.org/{z}/{x}/{y}.png",              opts:{ attribution:"© OpenStreetMap contributors",                     maxZoom:19 } },
+];
+
+// ─── Leaflet singleton ────────────────────────────────────────────────────────
+if (!window._swarmLeafletMap) window._swarmLeafletMap = null;
+if (!window._swarmLeafletContainer) window._swarmLeafletContainer = null;
+
+// ─── Foursquare API ───────────────────────────────────────────────────────────
+async function apiFetch(path, token, params = {}) {
+  const url = new URL(`https://api.foursquare.com/v2${path}`);
+  url.searchParams.set('oauth_token', token);
+  url.searchParams.set('v', API_V);
+  for (const [k, v] of Object.entries(params)) url.searchParams.set(k, v);
+  const res = await fetch(url.toString());
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  const json = await res.json();
+  if (json.meta?.code !== 200) throw new Error(json.meta?.errorDetail || `API error ${json.meta?.code}`);
+  return json.response;
+}
+async function fetchProfile(token) {
+  const r = await apiFetch('/users/self', token);
+  return r.user;
+}
+async function fetchAllCheckins(token, onProgress) {
+  const LIMIT = 250;
+  const first = await apiFetch('/users/self/checkins', token, { limit: LIMIT, offset: 0, sort: 'newestfirst' });
+  const total = first.checkins.count;
+  let all = [...first.checkins.items];
+  onProgress({ fetched: all.length, total });
+  const pages = Math.ceil(total / LIMIT);
+  for (let page = 1; page < pages; page++) {
+    const r = await apiFetch('/users/self/checkins', token, { limit: LIMIT, offset: page * LIMIT, sort: 'newestfirst' });
+    all = all.concat(r.checkins.items);
+    onProgress({ fetched: all.length, total });
+    await new Promise(r => setTimeout(r, 100));
+  }
+  return all;
+}
+
+// ─── MapView ──────────────────────────────────────────────────────────────────
+function MapView({ checkins, onCheckinClick, active, mapActionRef }) {
+  const divRef     = useRef(null);
+  const mapRef     = useRef(null);
+  const tileRef    = useRef(null);
+  const markersRef = useRef(null);
+  const fittedRef  = useRef(false);
+  const [mode, setMode]               = useState("locations");
+  const [highlightId, setHighlightId] = useState(null);
+  const [leafletReady, setLeafletReady] = useState(!!window.L);
+  const [mapReady, setMapReady]       = useState(false);
+
+  useEffect(() => {
+    if (!document.getElementById("lf-css")) {
+      const l = document.createElement("link");
+      l.id = "lf-css"; l.rel = "stylesheet";
+      l.href = "https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.css";
+      document.head.appendChild(l);
+    }
+    if (!document.getElementById("swarm-tt")) {
+      const s = document.createElement("style");
+      s.id = "swarm-tt";
+      s.textContent = `.swarm-tt{background:rgba(8,12,22,.93)!important;border:1px solid rgba(249,115,22,.5)!important;border-radius:8px!important;padding:7px 11px!important;box-shadow:0 4px 16px rgba(0,0,0,.4)!important}.swarm-tt::before{display:none!important}.leaflet-tooltip-top.swarm-tt::before{display:block!important;border-top-color:rgba(249,115,22,.5)!important}`;
+      document.head.appendChild(s);
+    }
+    if (window.L) return;
+    if (document.getElementById("lf-js")) {
+      const t = setInterval(() => { if (window.L) { clearInterval(t); setLeafletReady(true); } }, 50);
+      return () => clearInterval(t);
+    }
+    const s = document.createElement("script");
+    s.id = "lf-js";
+    s.src = "https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.js";
+    s.onload = () => setLeafletReady(true);
+    document.head.appendChild(s);
+  }, []);
+
+  useEffect(() => {
+    if (!leafletReady || !active || mapRef.current || !divRef.current) return;
+    if (window._swarmLeafletMap && window._swarmLeafletContainer && document.body.contains(window._swarmLeafletContainer)) {
+      mapRef.current = window._swarmLeafletMap;
+      window._swarmMap = window._swarmLeafletMap;
+      setMapReady(true);
+      if (mapActionRef) {
+        mapActionRef.current = {
+          flyTo: (lat, lng, zoom, venueKey) => {
+            try { window._swarmLeafletMap.flyTo([lat, lng], zoom, { duration: 0.8 }); } catch {}
+            if (venueKey !== undefined) {
+              setHighlightId(venueKey);
+              setTimeout(() => setHighlightId(null), 20000);
+            }
+          }
+        };
+      }
+      setTimeout(() => { try { window._swarmLeafletMap.invalidateSize(); } catch {} }, 50);
+      return;
+    }
+    let cancelled = false, retryTimer = null;
+    const tryCreate = () => {
+      if (cancelled || !divRef.current || mapRef.current) return;
+      const h = divRef.current.clientHeight, w = divRef.current.clientWidth;
+      if (!h || !w) { retryTimer = setTimeout(tryCreate, 100); return; }
+      const L = window.L;
+      let map;
+      try {
+        map = L.map(divRef.current, {
+          center: [20, 0], zoom: 2,
+          zoomControl: true, preferCanvas: true,
+          worldCopyJump: false,
+          maxBounds: [[-85.051, -180], [85.051, 180]], maxBoundsViscosity: 1.0,
+        });
+      } catch(e) { console.error('[SwarmMap] L.map() threw:', e); return; }
+      if (cancelled) { try { map.remove(); } catch {} return; }
+      window._swarmLeafletMap = map;
+      window._swarmLeafletContainer = divRef.current;
+      mapRef.current = map;
+      window._swarmMap = map;
+      setMapReady(true);
+      if (mapActionRef) {
+        mapActionRef.current = {
+          flyTo: (lat, lng, zoom, venueKey) => {
+            try { map.flyTo([lat, lng], zoom, { duration: 0.8 }); } catch {}
+            if (venueKey !== undefined) {
+              setHighlightId(venueKey);
+              setTimeout(() => setHighlightId(null), 20000);
+            }
+          }
+        };
+      }
+      const addTiles = (idx) => {
+        if (tileRef.current) { tileRef.current.remove(); tileRef.current = null; }
+        if (idx >= TILES.length) { console.warn('[SwarmMap] all tile providers exhausted'); return; }
+        let errs = 0;
+        const layer = L.tileLayer(TILES[idx].url, { ...TILES[idx].opts, noWrap: true, bounds: [[-85.051, -180], [85.051, 180]] }).addTo(map);
+        layer.on("tileerror", () => { if (++errs >= 8) { layer.off("tileerror"); addTiles(idx + 1); } });
+        tileRef.current = layer;
+      };
+      addTiles(0);
+      setTimeout(() => { try { map.invalidateSize(); } catch {} }, 200);
+    };
+    tryCreate();
+    return () => { cancelled = true; if (retryTimer) clearTimeout(retryTimer); };
+  }, [leafletReady, active]); // eslint-disable-line
+
+  useEffect(() => {
+    if (active && mapRef.current) setTimeout(() => { try { mapRef.current.invalidateSize(); } catch {} }, 50);
+  }, [active]);
+
+  useEffect(() => {
+    const map = mapRef.current, L = window.L;
+    if (!map || !L || !checkins.length || fittedRef.current) return;
+    fittedRef.current = true;
+    setTimeout(() => {
+      try {
+        map.fitBounds(L.latLngBounds(checkins.map(c => [c.lat, c.lng])), { padding: [40, 40], maxZoom: 13 });
+        setTimeout(() => { try { map.invalidateSize(); } catch {} }, 50);
+      } catch {}
+    }, 300);
+  });
+
+  useEffect(() => {
+    const map = mapRef.current, L = window.L;
+    if (!map || !L) return;
+    if (markersRef.current) { markersRef.current.remove(); markersRef.current = null; }
+    if (!checkins.length) return;
+    const layer = L.layerGroup();
+    if (mode === "heatmap") {
+      checkins.forEach(c => {
+        L.circleMarker([c.lat, c.lng], { radius: 20, fillColor: "#f97316", fillOpacity: .04, stroke: false }).addTo(layer);
+        L.circleMarker([c.lat, c.lng], { radius: 7,  fillColor: "#f97316", fillOpacity: .22, stroke: false }).addTo(layer);
+      });
+    } else {
+      const groups = {};
+      checkins.forEach(c => {
+        const key = c.venueId || `${Math.round(c.lat * 1e4)},${Math.round(c.lng * 1e4)}`;
+        if (!groups[key]) groups[key] = { lat: c.lat, lng: c.lng, name: c.name, city: c.city, key, checkins: [] };
+        groups[key].checkins.push(c);
+      });
+      Object.values(groups).forEach(g => {
+        const n      = g.checkins.length;
+        const latest = [...g.checkins].sort((a, b) => new Date(b.date) - new Date(a.date))[0];
+        const isHl   = highlightId === g.key;
+        const tip = `<div style="font-family:system-ui"><strong style="font-size:13px;color:#fff">${g.name}</strong>`
+          + (g.city ? `<br><span style="font-size:11px;color:#f97316">${g.city}</span>` : "")
+          + (mode === "locations" && n > 1 ? `<br><span style="font-size:11px;color:#9ca3af">${n} check-ins</span>` : "")
+          + `</div>`;
+        let m;
+        if (isHl) {
+          const pin = L.divIcon({
+            className: "",
+            html: `<svg width="28" height="40" viewBox="0 0 28 40" xmlns="http://www.w3.org/2000/svg" style="filter:drop-shadow(0 3px 6px rgba(0,0,0,.45))"><path d="M14 0C6.27 0 0 6.27 0 14c0 9.33 14 26 14 26s14-16.67 14-26C28 6.27 21.73 0 14 0z" fill="#ef4444"/><circle cx="14" cy="13" r="6" fill="white"/></svg>`,
+            iconSize: [28, 40], iconAnchor: [14, 40],
+          });
+          m = L.marker([g.lat, g.lng], { icon: pin, zIndexOffset: 1000 });
+          m.bindTooltip(tip, { direction: "top", offset: [0, -40], opacity: 1, className: "swarm-tt" });
+        } else if (mode === "checkins") {
+          m = L.circleMarker([g.lat, g.lng], { radius: 6, fillColor: "#f97316", fillOpacity: .85, color: "rgba(255,255,255,.7)", weight: 1.2 });
+          m.bindTooltip(tip, { direction: "top", offset: [0, -6], opacity: 1, className: "swarm-tt" });
+        } else {
+          const sz   = n === 1 ? 10 : n < 10 ? 18 : n < 50 ? 22 : 26;
+          const icon = L.divIcon({ className: "",
+            html: n === 1
+              ? `<div style="width:10px;height:10px;background:#f97316;border-radius:50%;border:1.5px solid rgba(255,255,255,.8);box-shadow:0 1px 3px rgba(0,0,0,.35)"></div>`
+              : `<div style="width:${sz}px;height:${sz}px;background:#f97316;border-radius:50%;border:1.5px solid rgba(255,255,255,.75);box-shadow:0 1px 4px rgba(0,0,0,.3);display:flex;align-items:center;justify-content:center;font-family:system-ui;font-size:${sz <= 18 ? 9 : 10}px;font-weight:700;color:#fff">${n}</div>`,
+            iconSize: [sz, sz], iconAnchor: [sz / 2, sz / 2],
+          });
+          m = L.marker([g.lat, g.lng], { icon });
+          m.bindTooltip(tip, { direction: "top", offset: [0, -6], opacity: 1, className: "swarm-tt" });
+        }
+        m.on("click", () => onCheckinClick(latest.id));
+        layer.addLayer(m);
+      });
+    }
+    layer.addTo(map);
+    markersRef.current = layer;
+  }, [checkins, mode, highlightId]); // eslint-disable-line
+
+  return (
+    <div style={{ position: "relative", width: "100%", height: "100%" }}>
+      <div ref={divRef} style={{ width: "100%", height: "100%", background: "#d4e0ec" }} />
+      {!mapReady && (
+        <div style={{ position: "absolute", inset: 0, zIndex: 10, display: "flex", alignItems: "center", justifyContent: "center", background: "#dde8f5" }}>
+          <span style={{ color: "#f97316", fontSize: 15 }}>Loading map…</span>
+        </div>
+      )}
+      <div style={{ position: "absolute", top: 12, left: 52, zIndex: 1000, display: "flex", gap: 4 }}>
+        {[{ id: "checkins", label: "📍 All locations" }, { id: "locations", label: "🔢 By location" }, { id: "heatmap", label: "🔥 Heatmap" }].map(({ id, label }) => (
+          <button key={id} onClick={() => setMode(id)} style={{
+            background: mode === id ? "#f97316" : "#fff",
+            color:      mode === id ? "#fff" : "#555",
+            border:    `1px solid ${mode === id ? "#f97316" : "#d1d5db"}`,
+            padding: "5px 11px", borderRadius: 6, cursor: "pointer",
+            fontSize: 12, fontFamily: "inherit",
+            fontWeight: mode === id ? 600 : 400,
+            boxShadow: "0 1px 4px rgba(0,0,0,.15)",
+          }}>{label}</button>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+// ─── Time helpers ─────────────────────────────────────────────────────────────
+function fmtTime(isoDate, lng) {
+  const off = lng!=null ? Math.round(lng/15) : 0;
+  const d = new Date(new Date(isoDate).getTime()+off*3600000);
+  return d.toLocaleTimeString("en-US",{hour:"numeric",minute:"2-digit",timeZone:"UTC"});
+}
+function dayKey(isoDate, lng) {
+  const off = lng!=null ? Math.round(lng/15) : 0;
+  const d = new Date(new Date(isoDate).getTime()+off*3600000);
+  return `${d.getUTCFullYear()}-${d.getUTCMonth()}-${d.getUTCDate()}`;
+}
+
+// ─── CalendarView ─────────────────────────────────────────────────────────────
+function CalendarView({ checkins, onCheckinClick, initialMonth, dateTarget }) {
+  const [currentMonth, setCurrentMonth] = useState(() => {
+    if (initialMonth) return { year: initialMonth.year, month: initialMonth.month };
+    const sorted=[...checkins].sort((a,b)=>new Date(b.date)-new Date(a.date));
+    if (sorted.length) { const d=new Date(sorted[0].date); return {year:d.getUTCFullYear(),month:d.getUTCMonth()}; }
+    const d=new Date(); return {year:d.getUTCFullYear(),month:d.getUTCMonth()};
+  });
+  const [selectedDay,  setSelectedDay]  = useState(null);
+  const [monthSortAsc, setMonthSortAsc] = useState(true);
+  const { year, month } = currentMonth;
+
+  const dayMap = useMemo(() => {
+    const m={};
+    checkins.forEach(c=>{
+      if (!c.date) return;
+      const k=dayKey(c.date,c.lng);
+      if (!m[k]) m[k]=[];
+      m[k].push(c);
+    });
+    Object.values(m).forEach(arr=>arr.sort((a,b)=>new Date(a.date)-new Date(b.date)));
+    return m;
+  }, [checkins]);
+
+  const monthDayKeys = useMemo(() =>
+    Object.keys(dayMap)
+      .filter(k=>{const [y,mo]=k.split("-");return +y===year&&+mo===month;})
+      .sort(monthSortAsc?undefined:(a,b)=>b.localeCompare(a)),
+  [dayMap,year,month,monthSortAsc]);
+
+  const monthCheckinCount = useMemo(()=>monthDayKeys.reduce((s,k)=>s+dayMap[k].length,0),[monthDayKeys,dayMap]);
+  const maxDayCount       = useMemo(()=>Math.max(...monthDayKeys.map(k=>dayMap[k].length),1),[monthDayKeys,dayMap]);
+  const dayCheckins       = useMemo(()=>selectedDay?(dayMap[selectedDay]||[]):[],[dayMap,selectedDay]);
+
+  useEffect(()=>{
+    if (dateTarget?.year===year && dateTarget?.month===month) return;
+    setSelectedDay(monthDayKeys[0]||null);
+  },[year,month]); // eslint-disable-line
+  useEffect(()=>{ if(initialMonth) setCurrentMonth({year:initialMonth.year,month:initialMonth.month}); },[initialMonth]); // eslint-disable-line
+
+  useEffect(()=>{
+    if (!dateTarget?.key) return;
+    setCurrentMonth({year:dateTarget.year,month:dateTarget.month});
+    setSelectedDay(dateTarget.key);
+  },[dateTarget]);
+
+  const firstDOW    = new Date(Date.UTC(year,month,1)).getUTCDay();
+  const daysInMonth = new Date(Date.UTC(year,month+1,0)).getUTCDate();
+  const cells = [...Array(firstDOW).fill(null),...Array.from({length:daysInMonth},(_,i)=>i+1)];
+
+  const selectedDayLabel = selectedDay?(()=>{
+    const [y,mo,d]=selectedDay.split("-").map(Number);
+    return new Date(Date.UTC(y,mo,d)).toLocaleDateString("en-US",{weekday:"long",day:"numeric",month:"long",year:"numeric",timeZone:"UTC"});
+  })():null;
+
+  const CheckinRow = ({c}) => (
+    <div onClick={()=>onCheckinClick(c.id)}
+      style={{padding:"7px 14px",borderBottom:`1px solid ${T.border}`,cursor:"pointer"}}
+      onMouseEnter={e=>e.currentTarget.style.background="#fafaf8"}
+      onMouseLeave={e=>e.currentTarget.style.background="transparent"}>
+      <div style={{fontWeight:600,fontSize:12,color:T.text,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{c.name}</div>
+      <div style={{fontSize:11,color:T.muted,marginTop:1,display:"flex",gap:5}}>
+        <span style={{color:T.accent,fontWeight:500}}>{fmtTime(c.date,c.lng)}</span>
+        {c.city&&<span>· {c.city}</span>}
+      </div>
+      {c.shout&&<div style={{fontSize:10,color:"#999",fontStyle:"italic",marginTop:2,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>"{c.shout}"</div>}
+    </div>
+  );
+
+  const DayGroup = ({dayKey:k}) => {
+    const items=dayMap[k];
+    const [y,mo,d]=k.split("-").map(Number);
+    const dt=new Date(Date.UTC(y,mo,d));
+    return (
+      <div>
+        <div style={{padding:"5px 14px 4px",borderTop:`3px solid ${T.accent}`,borderBottom:`1px solid rgba(249,115,22,.2)`,background:"rgba(249,115,22,.06)",display:"flex",alignItems:"baseline",gap:6}}>
+          <span style={{fontSize:11,fontWeight:700,color:T.accent}}>{DAYS[dt.getUTCDay()]}</span>
+          <span style={{fontSize:10,color:T.muted,flex:1}}>{dt.toLocaleDateString("en-US",{day:"numeric",month:"long",year:"numeric",timeZone:"UTC"})}</span>
+          <span style={{fontSize:10,color:T.muted}}>{items.length}✓</span>
+        </div>
+        {items.map(c=><CheckinRow key={c.id} c={c}/>)}
+      </div>
+    );
+  };
+
+  const navBtn={background:"transparent",border:`1px solid ${T.border}`,color:T.text,padding:"4px 14px",borderRadius:6,cursor:"pointer",fontSize:15,fontFamily:"inherit"};
+  const sortBtn=(active)=>({background:active?"rgba(249,115,22,.1)":"transparent",border:`1px solid ${active?"rgba(249,115,22,.4)":T.border}`,color:active?T.accent:T.muted,padding:"3px 9px",borderRadius:4,cursor:"pointer",fontSize:11,fontFamily:"inherit"});
+
+  return (
+    <div style={{display:"flex",flexDirection:"column",height:"100%",overflow:"hidden"}}>
+      <div style={{flex:1,display:"flex",overflow:"hidden"}}>
+        <div style={{width:"33.333%",minWidth:200,flexShrink:0,borderRight:`1px solid ${T.border}`,display:"flex",flexDirection:"column",background:T.card,overflow:"hidden"}}>
+          <div style={{padding:"9px 14px",borderBottom:`1px solid ${T.border}`,display:"flex",alignItems:"center",justifyContent:"space-between",flexShrink:0}}>
+            <span style={{fontSize:12,fontWeight:600,color:T.text}}>{monthCheckinCount} check-ins</span>
+            <div style={{display:"flex",gap:3}}>
+              <button style={sortBtn(monthSortAsc)}  onClick={()=>setMonthSortAsc(true)}>↑ Old</button>
+              <button style={sortBtn(!monthSortAsc)} onClick={()=>setMonthSortAsc(false)}>↓ New</button>
+            </div>
+          </div>
+          <div style={{flex:1,overflowY:"auto"}}>
+            {monthDayKeys.length===0
+              ?<div style={{padding:20,color:T.muted,fontSize:13}}>No check-ins this month</div>
+              :monthDayKeys.map(k=><DayGroup key={k} dayKey={k}/>)}
+          </div>
+        </div>
+        <div style={{flex:1,display:"flex",flexDirection:"column",overflow:"hidden",background:"#f8f8f6"}}>
+          <div style={{padding:"5px 16px",background:"rgba(249,115,22,.07)",borderBottom:"1px solid rgba(249,115,22,.2)",flexShrink:0}}>
+            <span style={{fontSize:11,color:"#a0622a"}}>⚠️ Times extrapolated from UTC by longitude. May be off for China, India, and a few other regions.</span>
+          </div>
+          <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",padding:"9px 20px",borderBottom:`1px solid ${T.border}`,background:T.card,flexShrink:0}}>
+            <button onClick={()=>setCurrentMonth(m=>{const d=new Date(Date.UTC(m.year,m.month-1,1));return{year:d.getUTCFullYear(),month:d.getUTCMonth()};})} style={navBtn}>‹</button>
+            <span style={{fontSize:16,fontWeight:600,color:T.text,fontFamily:"'DM Serif Display',serif"}}>{MONTHS[month]} {year}</span>
+            <button onClick={()=>setCurrentMonth(m=>{const d=new Date(Date.UTC(m.year,m.month+1,1));return{year:d.getUTCFullYear(),month:d.getUTCMonth()};})} style={navBtn}>›</button>
+          </div>
+          <div style={{padding:"10px 16px 8px",flexShrink:0,background:T.card,borderBottom:`1px solid ${T.border}`}}>
+            <div style={{maxWidth:360,margin:"0 auto"}}>
+              <div style={{display:"grid",gridTemplateColumns:"repeat(7,1fr)",gap:3,marginBottom:3}}>
+                {["Su","Mo","Tu","We","Th","Fr","Sa"].map(d=>(
+                  <div key={d} style={{textAlign:"center",fontSize:10,color:T.muted,fontWeight:700}}>{d}</div>
+                ))}
+              </div>
+              <div style={{display:"grid",gridTemplateColumns:"repeat(7,1fr)",gap:3}}>
+                {cells.map((day,i)=>{
+                  if (!day) return <div key={i}/>;
+                  const k=`${year}-${month}-${day}`;
+                  const cnt=dayMap[k]?.length||0;
+                  const intensity=cnt>0?0.15+(cnt/maxDayCount)*0.85:0;
+                  const sel=selectedDay===k;
+                  return (
+                    <div key={i} onClick={()=>cnt>0&&setSelectedDay(k)} style={{
+                      aspectRatio:"1",borderRadius:6,display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",
+                      background:cnt>0?`rgba(249,115,22,${intensity})`:"#f4f4f2",
+                      border:`2px solid ${sel?T.accent:cnt>0?"rgba(249,115,22,.25)":T.border}`,
+                      cursor:cnt>0?"pointer":"default",transition:"border-color .1s",
+                      boxShadow:sel?"0 0 0 1px rgba(249,115,22,.35)":"none",
+                    }}>
+                      <span style={{fontSize:12,color:cnt>0?"#fff":T.muted,fontWeight:cnt>0?600:400,lineHeight:1.2}}>{day}</span>
+                      {cnt>0&&<span style={{fontSize:9,color:"rgba(255,255,255,.85)",lineHeight:1}}>{cnt}</span>}
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+          </div>
+          <div style={{flex:1,display:"flex",flexDirection:"column",overflow:"hidden"}}>
+            <div style={{padding:"8px 16px",borderBottom:`1px solid ${T.border}`,borderTop:`3px solid ${selectedDay?T.accent:T.border}`,background:selectedDay?"rgba(249,115,22,.04)":T.card,flexShrink:0}}>
+              <span style={{fontSize:12,fontWeight:700,color:selectedDay?T.accent:T.muted}}>
+                {selectedDay?`${selectedDayLabel} · ${dayCheckins.length} check-in${dayCheckins.length!==1?"s":""}` :"Click a day above to see check-ins"}
+              </span>
+            </div>
+            <div style={{flex:1,overflowY:"auto",background:T.card}}>
+              {dayCheckins.length===0
+                ?<div style={{padding:20,color:T.muted,fontSize:13}}>{selectedDay?"No check-ins":"Select a highlighted day above"}</div>
+                :dayCheckins.map(c=><CheckinRow key={c.id} c={c}/>)}
+            </div>
+          </div>
+        </div>
+      </div>
+      <div style={{flexShrink:0,borderTop:`1px solid ${T.border}`,background:T.card,padding:"6px 20px",display:"flex",alignItems:"center",justifyContent:"center"}}>
+        <span style={{fontSize:11,color:T.muted}}>YHV – Your History, Visualized • Built with Claude Code</span>
+      </div>
+    </div>
+  );
+}
+
+// ─── StatsView ────────────────────────────────────────────────────────────────
+function StatsView({ checkins, onNavigateToMonth }) {
+  const [hoveredMonth, setHoveredMonth] = useState(null);
+  const [tipPos, setTipPos] = useState({x:0,y:0});
+
+  const stats = useMemo(()=>{
+    const venues={},cities={},cats={},months={};
+    checkins.forEach(c=>{
+      const vk=c.venueId||c.name;
+      venues[vk]=venues[vk]||{name:c.name,n:0}; venues[vk].n++;
+      if (c.city) cities[c.city]=(cities[c.city]||0)+1;
+      const cat=(c.category||"").trim();
+      if (cat&&cat!=="Other"&&cat!=="other") {
+        const k=cat.toLowerCase();
+        cats[k]=cats[k]||{name:cat,n:0}; cats[k].n++;
+      }
+      if (c.date) {
+        const d=new Date(c.date);
+        const k=`${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,"0")}`;
+        months[k]=(months[k]||0)+1;
+      }
+    });
+    return {
+      topVenues:Object.values(venues).sort((a,b)=>b.n-a.n).slice(0,10).map(v=>[v.name,v.n]),
+      topCities:Object.entries(cities).sort((a,b)=>b[1]-a[1]).slice(0,10),
+      monthData:Object.entries(months).sort(),
+      total:checkins.length,
+      uniqueVenues:Object.keys(venues).length,
+      uniqueCities:Object.keys(cities).length,
+      uniqueCats:Object.keys(cats).length,
+    };
+  },[checkins]);
+
+  const Bar = ({label,value,max}) => (
+    <div style={{marginBottom:8}}>
+      <div style={{display:"flex",justifyContent:"space-between",marginBottom:3}}>
+        <span style={{fontSize:13,color:T.text,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap",maxWidth:"70%"}}>{label}</span>
+        <span style={{fontSize:13,color:T.accent,fontWeight:600}}>{value}</span>
+      </div>
+      <div style={{height:4,background:"#f0f0ee",borderRadius:2,overflow:"hidden"}}>
+        <div style={{height:"100%",width:`${(value/max)*100}%`,background:`linear-gradient(90deg,${T.accent},#fb923c)`,borderRadius:2,transition:"width .5s ease"}}/>
+      </div>
+    </div>
+  );
+
+  const maxMonth=Math.max(...stats.monthData.map(m=>m[1]),1);
+
+  return (
+    <div style={{padding:24,maxWidth:900,margin:"0 auto"}}>
+      <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(140px,1fr))",gap:16,marginBottom:32}}>
+        {[
+          {label:"Total Checkins",value:stats.total.toLocaleString()},
+          {label:"Unique Venues", value:stats.uniqueVenues.toLocaleString()},
+          {label:"Cities",        value:stats.uniqueCities.toLocaleString()},
+          {label:"Categories",    value:stats.uniqueCats.toLocaleString()},
+        ].map(s=>(
+          <div key={s.label} style={{background:T.card,border:`1px solid ${T.border}`,borderRadius:12,padding:"20px 16px",textAlign:"center"}}>
+            <div style={{fontSize:28,fontWeight:700,color:T.accent,fontFamily:"'DM Serif Display',serif"}}>{s.value}</div>
+            <div style={{fontSize:12,color:T.muted,marginTop:4}}>{s.label}</div>
+          </div>
+        ))}
+      </div>
+      <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:24,marginBottom:24}}>
+        <div style={{background:T.card,border:`1px solid ${T.border}`,borderRadius:12,padding:20}}>
+          <h3 style={{margin:"0 0 16px",fontSize:14,color:T.muted,textTransform:"uppercase",letterSpacing:"0.1em"}}>Top Venues</h3>
+          {stats.topVenues.map(([n,c])=><Bar key={n} label={n} value={c} max={stats.topVenues[0]?.[1]||1}/>)}
+        </div>
+        <div style={{background:T.card,border:`1px solid ${T.border}`,borderRadius:12,padding:20}}>
+          <h3 style={{margin:"0 0 16px",fontSize:14,color:T.muted,textTransform:"uppercase",letterSpacing:"0.1em"}}>Top Cities</h3>
+          {stats.topCities.map(([n,c])=><Bar key={n} label={n} value={c} max={stats.topCities[0]?.[1]||1}/>)}
+        </div>
+      </div>
+      <div style={{background:T.card,border:`1px solid ${T.border}`,borderRadius:12,padding:20,marginBottom:24}}>
+        <h3 style={{margin:"0 0 16px",fontSize:14,color:T.muted,textTransform:"uppercase",letterSpacing:"0.1em"}}>Checkins Over Time</h3>
+        <div style={{overflowX:"auto"}}>
+          <div style={{display:"flex",gap:2,alignItems:"flex-end",minWidth:stats.monthData.length*18,height:160,paddingBottom:24,position:"relative"}}>
+            {stats.monthData.map(([key,cnt])=>{
+              const [yr,mo]=key.split("-");
+              const hovered=hoveredMonth===key;
+              const barH=Math.max(2,(cnt/maxMonth)*136);
+              return (
+                <div key={key}
+                  style={{position:"relative",flex:"0 0 16px",display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"flex-end",height:"100%",cursor:"pointer"}}
+                  onMouseEnter={e=>{setHoveredMonth(key);setTipPos({x:e.clientX,y:e.clientY});}}
+                  onMouseMove={e=>setTipPos({x:e.clientX,y:e.clientY})}
+                  onMouseLeave={()=>setHoveredMonth(null)}
+                  onClick={()=>onNavigateToMonth(parseInt(yr),parseInt(mo)-1)}>
+                  <div style={{width:"100%",height:barH,background:hovered?"#ea580c":`linear-gradient(180deg,${T.accent},#fb923c)`,borderRadius:"2px 2px 0 0",transition:"background .1s"}}/>
+                  {mo==="01"&&(
+                    <span style={{position:"absolute",bottom:-18,left:"50%",transform:"translateX(-50%) rotate(-45deg)",transformOrigin:"top center",fontSize:9,color:T.muted,whiteSpace:"nowrap",fontWeight:600}}>{yr}</span>
+                  )}
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      </div>
+      {hoveredMonth&&(()=>{
+        const [yr,mo]=hoveredMonth.split("-");
+        const cnt=stats.monthData.find(([k])=>k===hoveredMonth)?.[1]??0;
+        return (
+          <div style={{position:"fixed",left:tipPos.x+12,top:tipPos.y-56,background:"rgba(15,15,20,.92)",color:"#fff",borderRadius:7,padding:"7px 12px",fontSize:12,whiteSpace:"nowrap",zIndex:9999,pointerEvents:"none",boxShadow:"0 4px 12px rgba(0,0,0,.25)"}}>
+            <div style={{fontWeight:600,marginBottom:2}}>{MONTHS[parseInt(mo)-1]} {yr}</div>
+            <div style={{color:T.accent}}>{cnt} check-in{cnt!==1?"s":""}</div>
+            <div style={{color:"#aaa",fontSize:10,marginTop:3}}>Click to view in Calendar</div>
+          </div>
+        );
+      })()}
+    </div>
+  );
+}
+
+// ─── DetailPane ───────────────────────────────────────────────────────────────
+function DetailPane({ checkin, allCheckins, onClose, onNavigateToDate, onShowOnMap }) {
+  const [sortAsc, setSortAsc] = useState(false);
+
+  const venueCheckins = useMemo(()=>{
+    if (!checkin) return [];
+    const matches=checkin.venueId
+      ?allCheckins.filter(c=>c.venueId===checkin.venueId)
+      :allCheckins.filter(c=>c.lat===checkin.lat&&c.lng===checkin.lng);
+    return matches.sort((a,b)=>sortAsc?new Date(a.date)-new Date(b.date):new Date(b.date)-new Date(a.date));
+  },[allCheckins,checkin,sortAsc]);
+
+  if (!checkin) return null;
+
+  const linkBtn = {
+    background:"transparent", border:`1px solid ${T.border}`,
+    color:T.accent, padding:"3px 9px", borderRadius:4,
+    cursor:"pointer", fontSize:11, fontFamily:"inherit",
+    display:"inline-flex", alignItems:"center", gap:4,
+  };
+
+  return (
+    <div style={{width:320,flexShrink:0,background:T.card,borderLeft:`1px solid ${T.border}`,display:"flex",flexDirection:"column",overflow:"hidden"}}>
+      <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",padding:"16px 20px",borderBottom:`1px solid ${T.border}`,flexShrink:0}}>
+        <h3 style={{margin:0,fontSize:15,color:T.text,fontWeight:700}}>Location Detail</h3>
+        <button onClick={onClose} style={{background:"none",border:"none",color:T.muted,cursor:"pointer",fontSize:20,lineHeight:1}}>×</button>
+      </div>
+      <div style={{padding:"16px 20px",borderBottom:`1px solid ${T.border}`,flexShrink:0}}>
+        <h2 style={{margin:"0 0 4px",fontSize:18,color:T.text,fontFamily:"'DM Serif Display',serif",lineHeight:1.3}}>{checkin.name}</h2>
+        {checkin.city&&<div style={{fontSize:13,color:T.muted,marginBottom:4}}>{checkin.city}{checkin.country?`, ${checkin.country}`:""}</div>}
+        {checkin.address&&<div style={{fontSize:12,color:T.muted,marginBottom:8,lineHeight:1.5}}>{checkin.address}</div>}
+        <div style={{display:"flex",gap:6,flexWrap:"wrap",marginTop:4}}>
+          {checkin.venueId&&(
+            <a href={`https://foursquare.com/v/${checkin.venueId}`} target="_blank" rel="noreferrer" style={{...linkBtn,textDecoration:"none"}}>
+              🔗 Foursquare
+            </a>
+          )}
+          <button onClick={()=>onShowOnMap(checkin)} style={linkBtn}>🗺 Show on map</button>
+        </div>
+      </div>
+      <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",padding:"10px 20px",borderBottom:`1px solid ${T.border}`,flexShrink:0}}>
+        <span style={{fontSize:12,color:T.muted,fontWeight:600}}>{venueCheckins.length} check-in{venueCheckins.length!==1?"s":""}</span>
+        <div style={{display:"flex",gap:4}}>
+          {[false,true].map(asc=>(
+            <button key={String(asc)} onClick={()=>setSortAsc(asc)} style={{
+              background:sortAsc===asc?"rgba(249,115,22,.12)":"transparent",
+              border:`1px solid ${sortAsc===asc?"rgba(249,115,22,.4)":T.border}`,
+              color:sortAsc===asc?T.accent:T.muted,
+              padding:"3px 9px",borderRadius:4,cursor:"pointer",fontSize:11,fontFamily:"inherit",
+            }}>{asc?"Oldest first":"Newest first"}</button>
+          ))}
+        </div>
+      </div>
+      <div style={{flex:1,overflowY:"auto"}}>
+        {venueCheckins.map((c,i)=>(
+          <div key={c.id} style={{padding:"12px 20px",borderBottom:`1px solid ${T.border}`,background:i%2===0?"#fff":"#fafaf8"}}>
+            <div
+              onClick={()=>onNavigateToDate(c)}
+              title="Go to this day in Calendar"
+              style={{fontSize:13,color:T.accent,fontWeight:500,cursor:"pointer",display:"inline-flex",alignItems:"center",gap:4}}
+              onMouseEnter={e=>e.currentTarget.style.textDecoration="underline"}
+              onMouseLeave={e=>e.currentTarget.style.textDecoration="none"}
+            >
+              📅 {new Date(c.date).toLocaleString("en-US",{weekday:"short",month:"short",day:"numeric",year:"numeric",hour:"2-digit",minute:"2-digit"})}
+            </div>
+            {c.shout&&<div style={{marginTop:6,fontSize:12,color:"#555",fontStyle:"italic",lineHeight:1.5}}>"{c.shout}"</div>}
+            {c.photos?.length>0&&(
+              <div style={{display:"flex",gap:6,marginTop:8,overflowX:"auto"}}>
+                {c.photos.map((url,pi)=>(
+                  <img key={pi} src={url} alt="" style={{height:72,width:72,objectFit:"cover",borderRadius:6,flexShrink:0}} onError={e=>e.target.style.display="none"}/>
+                ))}
+              </div>
+            )}
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+// ─── SearchPane ───────────────────────────────────────────────────────────────
+function SearchPane({ query, allCheckins, onClose, onNavigateToDate, onShowOnMap }) {
+  const results = useMemo(()=>{
+    if (!query.trim()) return [];
+    const q=query.toLowerCase();
+    const groups={};
+    allCheckins.forEach(c=>{
+      if (!c.name?.toLowerCase().includes(q) && !c.city?.toLowerCase().includes(q)) return;
+      const key=c.venueId||`${Math.round(c.lat*1e4)},${Math.round(c.lng*1e4)}`;
+      if (!groups[key]) groups[key]={name:c.name,city:c.city,country:c.country,checkins:[]};
+      groups[key].checkins.push(c);
+    });
+    return Object.values(groups)
+      .map(g=>{
+        const sorted=[...g.checkins].sort((a,b)=>new Date(b.date)-new Date(a.date));
+        return {...g, latest:sorted[0], count:sorted.length};
+      })
+      .sort((a,b)=>new Date(b.latest.date)-new Date(a.latest.date))
+      .slice(0,50);
+  },[query,allCheckins]);
+
+  if (!query.trim()) return null;
+
+  const actionBtn = (label,onClick) => (
+    <button onClick={onClick} style={{
+      background:"transparent",border:`1px solid ${T.border}`,color:T.accent,
+      padding:"3px 8px",borderRadius:4,cursor:"pointer",fontSize:11,fontFamily:"inherit",whiteSpace:"nowrap",
+    }}>{label}</button>
+  );
+
+  return (
+    <div style={{position:"fixed",top:0,left:0,right:0,bottom:0,zIndex:9000,display:"flex",flexDirection:"column",background:"rgba(0,0,0,.45)"}}
+      onClick={onClose}>
+      <div style={{margin:"64px auto 12px",width:"min(640px,92vw)",background:T.card,borderRadius:12,boxShadow:"0 8px 40px rgba(0,0,0,.35)",display:"flex",flexDirection:"column",maxHeight:"calc(100vh - 100px)",overflow:"hidden"}}
+        onClick={e=>e.stopPropagation()}>
+        <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",padding:"14px 20px",borderBottom:`1px solid ${T.border}`,flexShrink:0}}>
+          <span style={{fontSize:14,fontWeight:600,color:T.text}}>
+            {results.length===0?"No results":`${results.length} venue${results.length!==1?"s":""} matching "${query}"`}
+          </span>
+          <button onClick={onClose} style={{background:"none",border:"none",color:T.muted,cursor:"pointer",fontSize:20,lineHeight:1}}>×</button>
+        </div>
+        <div style={{overflowY:"auto",flex:1}}>
+          {results.length===0?(
+            <div style={{padding:32,textAlign:"center",color:T.muted,fontSize:14}}>No venues or cities matching that search.</div>
+          ):results.map((r,i)=>(
+            <div key={i} style={{display:"flex",alignItems:"center",gap:12,padding:"12px 20px",borderBottom:`1px solid ${T.border}`,background:i%2===0?"#fff":"#fafaf8"}}>
+              <div style={{flex:1,minWidth:0}}>
+                <div style={{fontWeight:600,fontSize:13,color:T.text,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{r.name}</div>
+                <div style={{fontSize:11,color:T.muted,marginTop:2,display:"flex",gap:6}}>
+                  {r.city&&<span>{r.city}{r.country?`, ${r.country}`:""}</span>}
+                  <span style={{color:"#bbb"}}>·</span>
+                  <span>{r.count} check-in{r.count!==1?"s":""}</span>
+                  <span style={{color:"#bbb"}}>·</span>
+                  <span>Last: {new Date(r.latest.date).toLocaleDateString("en-US",{month:"short",day:"numeric",year:"numeric"})}</span>
+                </div>
+              </div>
+              <div style={{display:"flex",gap:6,flexShrink:0}}>
+                {actionBtn("📅 Calendar",()=>{ onNavigateToDate(r.latest); onClose(); })}
+                {actionBtn("🗺 Map",()=>{ onShowOnMap(r.latest); onClose(); })}
+              </div>
+            </div>
+          ))}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ─── FilterBar ────────────────────────────────────────────────────────────────
+function FilterBar({ checkins, filters, setFilters }) {
+  const [open, setOpen] = useState(false);
+  const inputStyle={background:"#f8f8f6",border:`1px solid ${T.border}`,color:T.text,padding:"6px 10px",borderRadius:6,fontSize:13,fontFamily:"inherit",outline:"none"};
+  const categories=useMemo(()=>[...new Set(checkins.map(c=>c.category).filter(Boolean))].sort(),[checkins]);
+  const cities    =useMemo(()=>[...new Set(checkins.map(c=>c.city).filter(Boolean))].sort(),[checkins]);
+  const hasFilters=filters.category||filters.city||filters.dateFrom||filters.dateTo;
+  if (!open&&!hasFilters) return (
+    <div style={{background:T.card,borderBottom:`1px solid ${T.border}`,padding:"4px 16px"}}>
+      <button onClick={()=>setOpen(true)} style={{background:"transparent",border:"none",color:T.muted,cursor:"pointer",fontSize:12,fontFamily:"inherit",padding:"4px 0"}}>
+        ⚙️ Filters
+      </button>
+    </div>
+  );
+  return (
+    <div style={{background:T.card,borderBottom:`1px solid ${T.border}`,position:"relative",zIndex:20}}>
+      <div style={{display:"flex",alignItems:"center",gap:12,padding:"8px 16px"}}>
+        <button onClick={()=>setOpen(o=>!o)} style={{background:T.card,border:`1px solid ${hasFilters?T.accent:T.border}`,color:hasFilters?T.accent:T.text,padding:"5px 12px",borderRadius:6,cursor:"pointer",fontSize:12,fontFamily:"inherit"}}>
+          {hasFilters?"🔶":"⚙️"} Filters {open?"▲":"▼"}
+        </button>
+        {hasFilters&&<button onClick={()=>setFilters({})} style={{background:"transparent",border:`1px solid ${T.border}`,color:T.accent,padding:"5px 12px",borderRadius:6,cursor:"pointer",fontSize:12,fontFamily:"inherit"}}>Clear filters</button>}
+      </div>
+      {open&&(
+        <div style={{padding:"0 16px 12px",display:"flex",flexWrap:"wrap",gap:10}}>
+          <select value={filters.category||""} onChange={e=>setFilters(f=>({...f,category:e.target.value}))} style={inputStyle}>
+            <option value="">All categories</option>
+            {categories.map(c=><option key={c} value={c}>{c}</option>)}
+          </select>
+          <select value={filters.city||""} onChange={e=>setFilters(f=>({...f,city:e.target.value}))} style={inputStyle}>
+            <option value="">All cities</option>
+            {cities.map(c=><option key={c} value={c}>{c}</option>)}
+          </select>
+          <input type="date" value={filters.dateFrom||""} onChange={e=>setFilters(f=>({...f,dateFrom:e.target.value}))} style={inputStyle}/>
+          <span style={{color:T.muted,alignSelf:"center",fontSize:12}}>to</span>
+          <input type="date" value={filters.dateTo||""} onChange={e=>setFilters(f=>({...f,dateTo:e.target.value}))} style={inputStyle}/>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ─── LoginScreen ──────────────────────────────────────────────────────────────
+function LoginScreen() {
+  const notConfigured = CLIENT_ID === 'YOUR_CLIENT_ID_HERE';
+  const oauthUrl = `https://foursquare.com/oauth2/authenticate?client_id=${CLIENT_ID}&response_type=token&redirect_uri=${encodeURIComponent(REDIRECT_URI)}`;
+
+  if (notConfigured) return (
+    <div style={{display:"flex",alignItems:"center",justifyContent:"center",minHeight:"100vh",padding:32,background:T.bg,fontFamily:"'DM Sans',sans-serif"}}>
+      <div style={{maxWidth:480,width:"100%",background:T.card,borderRadius:20,padding:"48px 44px",boxShadow:"0 8px 40px rgba(0,0,0,.1)",textAlign:"center"}}>
+        <div style={{fontSize:48,marginBottom:16}}>⚙️</div>
+        <h1 style={{margin:"0 0 12px",fontSize:28,fontFamily:"'DM Serif Display',serif",color:T.text}}>YHV – Setup Required</h1>
+        <p style={{color:T.muted,fontSize:15,lineHeight:1.6,marginBottom:24}}>
+          To use YHV, a Foursquare developer Client ID is required.
+        </p>
+        <div style={{background:"#f8f8f6",border:`1px solid ${T.border}`,borderRadius:10,padding:20,textAlign:"left",fontSize:13,color:T.text,lineHeight:1.8}}>
+          <strong>Setup steps:</strong><br/>
+          1. Go to <a href="https://foursquare.com/developers/apps" target="_blank" rel="noreferrer" style={{color:T.accent}}>foursquare.com/developers/apps</a><br/>
+          2. Create a new app &amp; copy the Client ID<br/>
+          3. Add <code style={{background:"#eee",padding:"1px 5px",borderRadius:3}}>{REDIRECT_URI}</code> as a Redirect URI<br/>
+          4. Replace <code style={{background:"#eee",padding:"1px 5px",borderRadius:3}}>YOUR_CLIENT_ID_HERE</code> in this file's <code style={{background:"#eee",padding:"1px 5px",borderRadius:3}}>CLIENT_ID</code> constant
+        </div>
+      </div>
+    </div>
+  );
+
+  return (
+    <div style={{display:"flex",alignItems:"center",justifyContent:"center",minHeight:"100vh",padding:32,background:T.bg,fontFamily:"'DM Sans',sans-serif"}}>
+      <div style={{maxWidth:420,width:"100%",background:T.card,borderRadius:20,padding:"48px 44px",boxShadow:"0 8px 40px rgba(0,0,0,.1)",textAlign:"center"}}>
+        <div style={{fontSize:48,marginBottom:16}}>📍</div>
+        <h1 style={{margin:"0 0 4px",fontSize:36,fontFamily:"'DM Serif Display',serif",color:T.text}}>YHV</h1>
+        <p style={{color:T.accent,fontSize:13,fontWeight:600,letterSpacing:"0.08em",textTransform:"uppercase",marginBottom:20}}>Your History, Visualized</p>
+        <p style={{color:T.muted,fontSize:15,marginBottom:36,lineHeight:1.5}}>
+          See every place you've ever been — mapped, charted, and searchable.
+        </p>
+        <a href={oauthUrl} style={{
+          display:"block",background:"linear-gradient(135deg,#f97316,#fb923c)",
+          color:"#fff",textDecoration:"none",borderRadius:12,
+          padding:"15px 32px",fontSize:16,fontWeight:600,
+          boxShadow:"0 4px 16px rgba(249,115,22,.35)",
+          transition:"opacity .15s",
+        }}
+          onMouseEnter={e=>e.currentTarget.style.opacity=".88"}
+          onMouseLeave={e=>e.currentTarget.style.opacity="1"}
+        >
+          Connect with Foursquare →
+        </a>
+        <p style={{color:T.muted,fontSize:12,marginTop:20,lineHeight:1.5}}>
+          Your data is fetched directly from Foursquare and stored only in your browser. YHV never sees or stores it.
+        </p>
+      </div>
+    </div>
+  );
+}
+
+// ─── FetchScreen ──────────────────────────────────────────────────────────────
+function FetchScreen({ token, onComplete, onError }) {
+  const [progress, setProgress] = useState({ fetched: 0, total: null, status: "Connecting…" });
+
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        setProgress({ fetched: 0, total: null, status: "Connecting to Foursquare…" });
+        const profile = await fetchProfile(token);
+        if (cancelled) return;
+        const name = [profile.firstName, profile.lastName].filter(Boolean).join(" ");
+        const avatar = profile.photo ? `${profile.photo.prefix}64x64${profile.photo.suffix}` : null;
+        localStorage.setItem(PROFILE_KEY, JSON.stringify({ name, avatar }));
+
+        setProgress({ fetched: 0, total: null, status: `Hi ${profile.firstName || "there"}! Fetching your check-ins…` });
+        const rawCheckins = await fetchAllCheckins(token, ({ fetched, total }) => {
+          if (!cancelled) setProgress({ fetched, total, status: "Fetching check-ins…" });
+        });
+        if (cancelled) return;
+
+        setProgress(p => ({ ...p, status: "Saving to browser…" }));
+        const parsed = rawCheckins.map(parseCheckin).filter(Boolean);
+        await clearAllCheckins();
+        await batchWrite(parsed);
+        if (!cancelled) onComplete(parsed, { name, avatar });
+      } catch (e) {
+        if (!cancelled) {
+          console.error("Fetch error:", e);
+          onError(e.message);
+        }
+      }
+    })();
+    return () => { cancelled = true; };
+  }, []); // eslint-disable-line
+
+  const pct = progress.total ? Math.round((progress.fetched / progress.total) * 100) : null;
+
+  return (
+    <div style={{display:"flex",alignItems:"center",justifyContent:"center",minHeight:"100vh",padding:32,background:T.bg,fontFamily:"'DM Sans',sans-serif"}}>
+      <div style={{maxWidth:420,width:"100%",background:T.card,borderRadius:20,padding:"48px 44px",boxShadow:"0 8px 40px rgba(0,0,0,.1)",textAlign:"center"}}>
+        <div style={{fontSize:48,marginBottom:16}}>📍</div>
+        <h1 style={{margin:"0 0 8px",fontSize:28,fontFamily:"'DM Serif Display',serif",color:T.text}}>Building your history…</h1>
+        <p style={{color:T.muted,fontSize:14,marginBottom:32}}>{progress.status}</p>
+        <div style={{height:6,background:T.border,borderRadius:3,overflow:"hidden",marginBottom:12}}>
+          <div style={{
+            height:"100%",borderRadius:3,
+            background:"linear-gradient(90deg,#f97316,#fb923c)",
+            transition:"width .4s ease",
+            width: pct != null ? `${pct}%` : "30%",
+            animation: pct == null ? "pulse 1.5s ease-in-out infinite" : "none",
+          }}/>
+        </div>
+        {progress.total != null && (
+          <p style={{color:T.muted,fontSize:13}}>
+            {progress.fetched.toLocaleString()} of {progress.total.toLocaleString()} check-ins
+          </p>
+        )}
+        <style>{`@keyframes pulse{0%,100%{opacity:.5;width:30%}50%{opacity:1;width:60%}}`}</style>
+      </div>
+    </div>
+  );
+}
+
+// ─── App ──────────────────────────────────────────────────────────────────────
+function App() {
+  // phase: "init" | "login" | "fetching" | "app"
+  const [phase,          setPhase]          = useState("init");
+  const [checkins,       setCheckins]       = useState([]);
+  const [profile,        setProfile]        = useState(null);
+  const [fetchError,     setFetchError]     = useState(null);
+  const [view,           setView]           = useState("map");
+  const [selectedId,     setSelectedId]     = useState(null);
+  const [filters,        setFilters]        = useState({});
+  const [searchQuery,    setSearchQuery]    = useState("");
+  const [showSearch,     setShowSearch]     = useState(false);
+  const [calendarTarget, setCalendarTarget] = useState(null);
+  const [dateTarget,     setDateTarget]     = useState(null);
+  const mapActionRef = useRef(null);
+  const searchRef    = useRef();
+
+  // Load Google Fonts
+  useEffect(()=>{
+    if (!document.getElementById("gfonts")) {
+      const l=document.createElement("link");
+      l.id="gfonts"; l.rel="stylesheet";
+      l.href="https://fonts.googleapis.com/css2?family=DM+Serif+Display:ital@0;1&family=DM+Sans:wght@300;400;500;600;700&display=swap";
+      document.head.appendChild(l);
+    }
+  },[]);
+
+  // Boot: handle OAuth callback, then decide phase
+  useEffect(() => {
+    // Check for token in URL hash (OAuth callback)
+    const hash = new URLSearchParams(window.location.hash.replace(/^#/, ''));
+    const urlToken = hash.get('access_token');
+    if (urlToken) {
+      localStorage.setItem(TOKEN_KEY, urlToken);
+      history.replaceState(null, '', window.location.pathname + window.location.search);
+    }
+
+    const token = localStorage.getItem(TOKEN_KEY);
+    if (!token) { setPhase("login"); return; }
+
+    // Load saved profile
+    const savedProfile = localStorage.getItem(PROFILE_KEY);
+    if (savedProfile) { try { setProfile(JSON.parse(savedProfile)); } catch {} }
+
+    // Check if we have cached checkins
+    (async () => {
+      try {
+        const count = await getCheckinCount();
+        if (count > 0) {
+          const data = await getAllCheckins();
+          setCheckins(data);
+          setPhase("app");
+        } else {
+          setPhase("fetching");
+        }
+      } catch (e) {
+        console.error(e);
+        setPhase("fetching");
+      }
+    })();
+  }, []);
+
+  const handleLogout = async () => {
+    localStorage.removeItem(TOKEN_KEY);
+    localStorage.removeItem(PROFILE_KEY);
+    await clearAllCheckins();
+    // Reset Leaflet singleton so map reinitialises on next login
+    try { if (window._swarmLeafletMap) { window._swarmLeafletMap.remove(); } } catch {}
+    window._swarmLeafletMap = null;
+    window._swarmLeafletContainer = null;
+    setCheckins([]);
+    setProfile(null);
+    setPhase("login");
+  };
+
+  const handleRefresh = async () => {
+    await clearAllCheckins();
+    setCheckins([]);
+    setFetchError(null);
+    setPhase("fetching");
+  };
+
+  const filteredCheckins = useMemo(()=>checkins.filter(c=>{
+    if (filters.category && c.category!==filters.category) return false;
+    if (filters.city     && c.city!==filters.city) return false;
+    if (filters.dateFrom && c.date<filters.dateFrom) return false;
+    if (filters.dateTo   && c.date>filters.dateTo+"T23:59:59") return false;
+    return true;
+  }),[checkins,filters]);
+
+  const selectedCheckin = useMemo(()=>checkins.find(c=>c.id===selectedId),[checkins,selectedId]);
+
+  const handleNavigateToDate = (checkin) => {
+    const d = new Date(checkin.date);
+    const year  = d.getUTCFullYear();
+    const month = d.getUTCMonth();
+    const key   = dayKey(checkin.date, checkin.lng);
+    setDateTarget({year, month, key, _t:Date.now()});
+    setCalendarTarget({year, month, _t:Date.now()});
+    setView("calendar");
+  };
+
+  const handleShowOnMap = (checkin) => {
+    setSelectedId(checkin.id);
+    setView("map");
+    setTimeout(() => {
+      const venueKey = checkin.venueId || `${Math.round(checkin.lat*1e4)},${Math.round(checkin.lng*1e4)}`;
+      if (mapActionRef.current?.flyTo) mapActionRef.current.flyTo(checkin.lat, checkin.lng, 15, venueKey);
+    }, 100);
+  };
+
+  // ── Phase renders ──────────────────────────────────────────────
+  if (phase === "init") return (
+    <div style={{display:"flex",alignItems:"center",justifyContent:"center",minHeight:"100vh",background:T.bg,fontFamily:"'DM Sans',sans-serif"}}>
+      <div style={{textAlign:"center"}}>
+        <div style={{fontSize:48,marginBottom:16}}>📍</div>
+        <p style={{color:T.muted,fontSize:16}}>YHV is loading…</p>
+      </div>
+    </div>
+  );
+
+  if (phase === "login") return <LoginScreen/>;
+
+  if (phase === "fetching") {
+    const token = localStorage.getItem(TOKEN_KEY);
+    if (!token) { setPhase("login"); return null; }
+    return (
+      <div style={{fontFamily:"'DM Sans',sans-serif"}}>
+        {fetchError && (
+          <div style={{position:"fixed",top:0,left:0,right:0,zIndex:999,background:"#fef2f2",borderBottom:"1px solid #fca5a5",padding:"10px 20px",display:"flex",gap:12,alignItems:"center",fontSize:13}}>
+            <span style={{color:"#dc2626",fontWeight:600}}>⚠️ Error: {fetchError}</span>
+            <button onClick={()=>{ localStorage.removeItem(TOKEN_KEY); setFetchError(null); setPhase("login"); }} style={{marginLeft:"auto",background:"transparent",border:"1px solid #fca5a5",color:"#dc2626",padding:"4px 10px",borderRadius:5,cursor:"pointer",fontSize:12,fontFamily:"inherit"}}>
+              Log out &amp; retry
+            </button>
+          </div>
+        )}
+        <FetchScreen
+          token={token}
+          onComplete={(data, prof) => {
+            setCheckins(data);
+            if (prof) setProfile(prof);
+            setPhase("app");
+          }}
+          onError={(msg) => setFetchError(msg)}
+        />
+      </div>
+    );
+  }
+
+  // ── phase === "app" ────────────────────────────────────────────
+  const btnStyle = (active) => ({
+    background: active ? "rgba(249,115,22,.12)" : "transparent",
+    border: `1px solid ${active ? "rgba(249,115,22,.4)" : "transparent"}`,
+    color: active ? T.accent : T.muted,
+    padding: "5px 12px", borderRadius: 6, cursor: "pointer",
+    fontSize: 13, fontFamily: "inherit",
+    fontWeight: active ? 600 : 400, transition: "all .15s",
+  });
+
+  return (
+    <div style={{fontFamily:"'DM Sans',sans-serif",display:"flex",flexDirection:"column",height:"100vh",background:T.bg,color:T.text}}>
+      {/* Header */}
+      <div style={{display:"flex",alignItems:"center",gap:12,padding:"0 16px",height:52,background:T.card,borderBottom:`1px solid ${T.border}`,flexShrink:0,zIndex:30}}>
+        <h1 style={{margin:0,fontSize:18,fontFamily:"'DM Serif Display',serif",color:T.text,display:"flex",alignItems:"center",gap:6,flexShrink:0}}>
+          <span>📍</span> YHV
+        </h1>
+
+        {/* Profile avatar + name */}
+        {profile && (
+          <div style={{display:"flex",alignItems:"center",gap:6,flexShrink:0}}>
+            {profile.avatar && (
+              <img src={profile.avatar} alt="" style={{width:24,height:24,borderRadius:"50%",objectFit:"cover"}} onError={e=>e.target.style.display="none"}/>
+            )}
+            <span style={{fontSize:12,color:T.muted,maxWidth:120,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{profile.name}</span>
+          </div>
+        )}
+
+        <span style={{fontSize:12,color:T.muted,flexShrink:0}}>
+          {filteredCheckins.length.toLocaleString()} checkins{filteredCheckins.length!==checkins.length?` (of ${checkins.length.toLocaleString()})`:""}
+        </span>
+
+        {/* Search */}
+        <div style={{flex:1,maxWidth:320,position:"relative"}}>
+          <input
+            ref={searchRef}
+            placeholder="🔍 Search venues &amp; cities…"
+            value={searchQuery}
+            onChange={e=>{ setSearchQuery(e.target.value); setShowSearch(!!e.target.value); }}
+            onFocus={()=>{ if(searchQuery) setShowSearch(true); }}
+            style={{width:"100%",background:"#f8f8f6",border:`1px solid ${searchQuery?T.accent:T.border}`,color:T.text,padding:"6px 28px 6px 10px",borderRadius:6,fontSize:13,fontFamily:"inherit",outline:"none",boxSizing:"border-box"}}
+          />
+          {searchQuery&&(
+            <button onClick={()=>{ setSearchQuery(""); setShowSearch(false); }} style={{position:"absolute",right:6,top:"50%",transform:"translateY(-50%)",background:"none",border:"none",color:T.muted,cursor:"pointer",fontSize:14,padding:0,lineHeight:1}}>×</button>
+          )}
+        </div>
+
+        <div style={{flex:1}}/>
+
+        {/* View tabs */}
+        <div style={{display:"flex",gap:4}}>
+          {[{id:"map",label:"🗺 Map"},{id:"calendar",label:"📅 Calendar"},{id:"stats",label:"📊 Stats"}].map(n=>(
+            <button key={n.id} onClick={()=>setView(n.id)} style={btnStyle(view===n.id)}>{n.label}</button>
+          ))}
+        </div>
+
+        {/* Refresh */}
+        <button onClick={handleRefresh} title="Re-fetch all check-ins from Foursquare" style={{background:"transparent",border:`1px solid ${T.border}`,color:T.muted,padding:"6px 12px",borderRadius:6,cursor:"pointer",fontSize:12,fontFamily:"inherit"}}>
+          ↻ Refresh
+        </button>
+
+        {/* Logout */}
+        <button onClick={handleLogout} style={{background:"transparent",border:`1px solid ${T.border}`,color:T.muted,padding:"6px 12px",borderRadius:6,cursor:"pointer",fontSize:12,fontFamily:"inherit"}}>
+          Sign out
+        </button>
+      </div>
+
+      <FilterBar checkins={checkins} filters={filters} setFilters={setFilters}/>
+
+      {/* Main */}
+      <div style={{flex:1,display:"flex",overflow:"hidden",position:"relative"}}>
+        <div style={{flex:1,overflow:"hidden",position:"relative"}}>
+
+          {/* Map — always mounted */}
+          <div style={{position:"absolute",inset:0,display:view==="map"?"block":"none"}}>
+            <MapView checkins={filteredCheckins} onCheckinClick={setSelectedId} active={view==="map"} mapActionRef={mapActionRef}/>
+          </div>
+
+          {view==="calendar"&&(
+            <div style={{position:"absolute",inset:0}}>
+              <CalendarView
+                checkins={filteredCheckins}
+                onCheckinClick={setSelectedId}
+                initialMonth={calendarTarget}
+                dateTarget={dateTarget}
+              />
+            </div>
+          )}
+
+          {view==="stats"&&(
+            <div style={{position:"absolute",inset:0,overflowY:"auto"}}>
+              <StatsView
+                checkins={filteredCheckins}
+                onNavigateToMonth={(yr,mo)=>{ setCalendarTarget({year:yr,month:mo,_t:Date.now()}); setView("calendar"); }}
+              />
+            </div>
+          )}
+
+          {showSearch&&(
+            <SearchPane
+              query={searchQuery}
+              allCheckins={checkins}
+              onClose={()=>setShowSearch(false)}
+              onNavigateToDate={handleNavigateToDate}
+              onShowOnMap={handleShowOnMap}
+            />
+          )}
+
+        </div>
+
+        {selectedCheckin&&(
+          <DetailPane
+            checkin={selectedCheckin}
+            allCheckins={checkins}
+            onClose={()=>setSelectedId(null)}
+            onNavigateToDate={handleNavigateToDate}
+            onShowOnMap={handleShowOnMap}
+          />
+        )}
+      </div>
+    </div>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById('root')).render(React.createElement(App));
+
+  </script>
+</body>
+</html>
