@@ -429,7 +429,7 @@ function dayKey(isoDate, lng) {
 }
 
 // ─── CalendarView ────────────────────────────────────────────────────────────
-function CalendarView({ checkins, onCheckinDetail, initialMonth, dateTarget }) {
+function CalendarView({ checkins, onCheckinDetail, onVenueClick, initialMonth, dateTarget }) {
   const [currentMonth, setCurrentMonth] = useState(() => {
     if (initialMonth) return { year:initialMonth.year, month:initialMonth.month };
     const sorted=[...checkins].sort((a,b)=>new Date(b.date)-new Date(a.date));
@@ -513,8 +513,8 @@ function CalendarView({ checkins, onCheckinDetail, initialMonth, dateTarget }) {
     setCurrentMonth({year:d.getUTCFullYear(),month:d.getUTCMonth()});
   };
 
-  const CheckinRow = ({c}) => (
-    <div onClick={()=>onCheckinDetail(c)}
+  const CheckinRow = ({c, onClick}) => (
+    <div onClick={()=>onClick(c)}
       style={{padding:"7px 14px",borderBottom:`1px solid ${T.border}`,cursor:"pointer"}}
       onMouseEnter={e=>e.currentTarget.style.background="#fafaf8"}
       onMouseLeave={e=>e.currentTarget.style.background="transparent"}>
@@ -538,7 +538,7 @@ function CalendarView({ checkins, onCheckinDetail, initialMonth, dateTarget }) {
           <span style={{fontSize:10,color:T.muted,flex:1}}>{dt.toLocaleDateString("en-US",{day:"numeric",month:"long",year:"numeric",timeZone:"UTC"})}</span>
           <span style={{fontSize:10,color:T.muted}}>{items.length}✓</span>
         </div>
-        {items.map(c=><CheckinRow key={c.id} c={c}/>)}
+        {items.map(c=><CheckinRow key={c.id} c={c} onClick={onVenueClick||onCheckinDetail}/>)}
       </div>
     );
   };
@@ -554,7 +554,10 @@ function CalendarView({ checkins, onCheckinDetail, initialMonth, dateTarget }) {
         {/* Left: month day list */}
         <div style={{width:"33.333%",minWidth:200,flexShrink:0,borderRight:`1px solid ${T.border}`,display:"flex",flexDirection:"column",background:T.card,overflow:"hidden"}}>
           <div style={{padding:"9px 14px",borderBottom:`1px solid ${T.border}`,display:"flex",alignItems:"center",justifyContent:"space-between",flexShrink:0}}>
-            <span style={{fontSize:12,fontWeight:600,color:T.text}}>{monthCheckinCount} check-ins</span>
+            <div>
+              <span style={{fontSize:12,fontWeight:600,color:T.text}}>{monthCheckinCount} check-ins</span>
+              <div style={{fontSize:10,color:T.muted,marginTop:1}}>Click for all visits to a venue</div>
+            </div>
             <div style={{display:"flex",gap:3}}>
               <button style={sortBtn(monthSortAsc)}  onClick={()=>setMonthSortAsc(true)}>↑ Old</button>
               <button style={sortBtn(!monthSortAsc)} onClick={()=>setMonthSortAsc(false)}>↓ New</button>
@@ -625,11 +628,12 @@ function CalendarView({ checkins, onCheckinDetail, initialMonth, dateTarget }) {
               <span style={{fontSize:12,fontWeight:700,color:selectedDay?T.accent:T.muted}}>
                 {selectedDay?`${selectedDayLabel} · ${dayCheckins.length} check-in${dayCheckins.length!==1?"s":""}` :"Click a day above to see check-ins"}
               </span>
+              {selectedDay&&<div style={{fontSize:10,color:T.muted,marginTop:1}}>Click a check-in for full details</div>}
             </div>
             <div style={{flex:1,overflowY:"auto",background:T.card}}>
               {dayCheckins.length===0
                 ?<div style={{padding:20,color:T.muted,fontSize:13}}>{selectedDay?"No check-ins":"Select a highlighted day above"}</div>
-                :dayCheckins.map(c=><CheckinRow key={c.id} c={c}/>)}
+                :dayCheckins.map(c=><CheckinRow key={c.id} c={c} onClick={onCheckinDetail}/>)}
             </div>
           </div>
         </div>
@@ -914,7 +918,12 @@ function CheckinModal({ checkin, onClose, onShowOnMap }) {
       // Use CARTO (more CORS-friendly for mini-maps) with bounds guard
       const tileConf = TILES[1] || TILES[0];
       L.tileLayer(tileConf.url, {...tileConf.opts, noWrap:true, bounds:[[-85.051,-180],[85.051,180]]}).addTo(miniMap);
-      L.circleMarker([checkin.lat,checkin.lng],{radius:8,fillColor:T.accent,fillOpacity:1,color:"#fff",weight:2}).addTo(miniMap);
+      const marker = L.circleMarker([checkin.lat,checkin.lng],{radius:10,fillColor:T.accent,fillOpacity:1,color:"#fff",weight:2}).addTo(miniMap);
+      marker.bindTooltip("Click to open in map view",{direction:"top",offset:[0,-10],opacity:0.9});
+      // Clicking the marker or anywhere on the mini-map navigates to map view
+      const handleClick = () => onShowOnMap(checkin);
+      marker.on("click", handleClick);
+      miniMap.on("click", handleClick);
       setTimeout(()=>{ try { miniMap.invalidateSize(); } catch {} }, 50);
     } catch(e) { console.warn("Mini-map error:", e); }
     return ()=>{ try { if(miniMap) miniMap.remove(); } catch {} };
@@ -951,8 +960,13 @@ function CheckinModal({ checkin, onClose, onShowOnMap }) {
         {/* Scrollable body */}
         <div style={{flex:1,overflowY:"auto"}}>
 
-          {/* Mini-map */}
-          <div ref={miniMapRef} style={{height:180,background:"#dde8f5",flexShrink:0}}/>
+          {/* Mini-map — click to open in main map view */}
+          <div style={{position:"relative",flexShrink:0}}>
+            <div ref={miniMapRef} style={{height:180,background:"#dde8f5",cursor:"pointer"}}/>
+            <div style={{position:"absolute",bottom:6,right:6,zIndex:500,background:"rgba(0,0,0,.55)",color:"#fff",fontSize:10,padding:"3px 7px",borderRadius:4,pointerEvents:"none"}}>
+              🗺 Click to view on map
+            </div>
+          </div>
 
           <div style={{padding:"16px 20px"}}>
             {/* Date + time */}
@@ -1391,6 +1405,7 @@ function App() {
             <CalendarView
               checkins={filteredCheckins}
               onCheckinDetail={setModalCheckin}
+              onVenueClick={c=>setSelectedId(c.id)}
               initialMonth={calendarTarget}
               dateTarget={dateTarget}
             />
